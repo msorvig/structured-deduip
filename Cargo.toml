@@ -14,3 +14,7 @@ indicatif = { version = "*", features = ["rayon"] }
 rand = "0.7"
 serde = { version =  "1.0", features = ["derive"] }
 bincode = "1.2"
+num_cpus = "1.13.0"
+itertools = "0.10.0"
+crossbeam = "0.8"
+blake3 = "*"
