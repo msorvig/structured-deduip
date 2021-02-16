@@ -4,8 +4,9 @@ use jwalk::{DirEntry, WalkDir};
 use rayon::iter::{ParallelBridge, ParallelIterator};
 use rayon::prelude::*;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use std::sync::Arc;
-use std::{cmp::Ordering, collections::HashMap, fs::File, io::Read, path::Path, sync::Mutex};
+use std::{cmp::Ordering, sync::Arc};
+use std::{io::Read, path::Path, sync::Mutex};
+// use std::{cmp::Ordering, collections::HashMap, fs::File,
 extern crate num_cpus;
 use crossbeam::atomic::AtomicCell;
 use itertools::Itertools;
@@ -78,8 +79,6 @@ fn scan_dir2(path: &str) -> Vec<JWalkDirEntry> {
 
     return final_entries;
 }
-
-//#[derive(Serialize, Deserialize, Debug)]
 struct AtomicCellU128(AtomicCell<Option<u128>>);
 
 impl AtomicCellU128 {
@@ -93,6 +92,26 @@ impl AtomicCellU128 {
 
     fn store(&self, val: Option<u128>) {
         self.0.store(val)
+    }
+}
+
+impl PartialEq for AtomicCellU128 {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.load() == other.0.load()
+    }
+}
+
+impl Eq for AtomicCellU128 {}
+
+impl Ord for AtomicCellU128 {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.0.load().cmp(&other.0.load())
+    }
+}
+
+impl PartialOrd for AtomicCellU128 {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
     }
 }
 
@@ -124,7 +143,7 @@ impl<'de> Deserialize<'de> for AtomicCellU128 {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Eq)]
 struct FileEntry {
     name: String,
     path: PathBuf,
@@ -153,6 +172,39 @@ impl FileEntry {
             digest: AtomicCellU128::new(None),
         })
     }
+
+    fn load_digest(&self) -> u128 {
+        match self.digest.load() {
+            Some(digest) => digest,
+            None => {
+                let digest = compute_file_digest(&self.path);
+                self.digest.store(digest);
+                digest.unwrap()
+            }
+        }
+    }
+}
+
+impl PartialEq for FileEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.load_digest() == other.load_digest()
+    }
+}
+
+impl Ord for FileEntry {
+    fn cmp(&self, other: &Self) -> Ordering {
+        let digest_ordering = self.load_digest().cmp(&other.load_digest());
+        match digest_ordering {
+            Ordering::Equal => self.path.cmp(&other.path),
+            _ => digest_ordering,
+        }
+    }
+}
+
+impl PartialOrd for FileEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 impl TryFrom<JWalkDirEntry> for FileEntry {
@@ -165,8 +217,9 @@ impl TryFrom<JWalkDirEntry> for FileEntry {
         }
     }
 }
+
 fn filter_files(entries: Vec<JWalkDirEntry>) -> Vec<FileEntry> {
-    let min_file_size = 0; // Skip small files
+    let min_file_size = 1024; // Skip small files
     entries
         .par_iter()
         .filter_map(|jentry| {
@@ -194,8 +247,7 @@ fn compute_file_digest(path: &Path) -> Option<u128> {
             Some(compute_digest(&data))
         }
         Err(e) => {
-            println!("Error opening {:?} {:?}", path, e);
-            None
+            panic!("Error opening {:?} {:?}", path, e);
         }
     }
 }
@@ -206,6 +258,38 @@ fn compute_digests(entries: &mut Vec<FileEntry>) {
         entry.digest.store(digest);
         //  println!("digest for {:?} {:?}", entry.path,  digest);
     });
+}
+
+fn group_by_digest(numbers: &Vec<FileEntry>) -> impl Iterator<Item = &[FileEntry]> {
+    numbers.iter().enumerate().peekable().batching(move |it| {
+        match it.next() {
+            None => None,
+            Some(elem) => {
+                // it.next() gave us the beginning of a group. Determine the end
+                // by looping until peek() gives an element with a different value.
+
+                let begin_i = elem.0;
+                let group_value = elem.1;
+                let mut end_i = begin_i;
+                loop {
+                    match it.peek() {
+                        None => break,
+                        Some(elem) => {
+                            if elem.1 == group_value {
+                                end_i += 1;
+                                it.next();
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                // yield the group as a slice
+                Some(&numbers[begin_i..end_i + 1])
+            }
+        }
+    })
 }
 
 fn compute_savings(entries: Vec<JWalkDirEntry>) {
@@ -219,75 +303,37 @@ fn compute_savings(entries: Vec<JWalkDirEntry>) {
     println!("Compute digests");
     compute_digests(&mut file_entries);
 
-    /*
-    println!("Sorting by name and size");
-    file_entries.par_sort_unstable_by(|a, b| {
-        let name_ordering =  a.name.cmp(&b.name);
-        match name_ordering {
-            Ordering::Equal => {
-                a.len.cmp(&b.len)
-            },
-            Ordering::Less => {
-                Ordering::Less
-            },
-            Ordering::Greater => {
-                Ordering::Greater
-            }
-        }
-    });
-    */
-
     println!("Sorting by digest");
     file_entries.par_sort_unstable_by(|a, b| a.digest.load().cmp(&b.digest.load()));
 
-    let groups_it =
-        file_entries
-            .iter()
-            .fold(HashMap::<u128, Vec<&FileEntry>>::new(), |mut acc, entry| {
-                let vec = acc
-                    .entry(entry.digest.load().unwrap())
-                    .or_insert_with(|| Vec::new());
-                vec.push(entry);
-                acc
-            });
+    let groups_it = group_by_digest(&file_entries);
 
-    let dedup_bytes = groups_it
-        .iter()
-        .fold(0, |acc, entry| acc + entry.1.get(0).unwrap().len);
-
-    let group_count = groups_it.iter().count();
+    for g in groups_it.filter(|x| x.len() > 10).take(10) {
+        let mut pk_g = g.iter().peekable();
+        let first = *pk_g.peek().unwrap();
+        println!("");
+        println!(
+            "Group: {} file count {} file size {} digest {:?}",
+            first.name,
+            g.len(),
+            first.len,
+            first.digest.load()
+        );
+        println!("Files:");
+        for file in pk_g {
+            println!("   {}", file.path.to_str().unwrap());
+        }
+    }
 
     println!("Duped  : {} bytes", file_bytes);
-    println!("Deduped: {} bytes", dedup_bytes);
+    //    println!("Deduped: {} bytes", dedup_bytes);
     println!("files : {}", file_count);
-    println!("groups: {}", group_count);
+    //println!("groups: {}", group_count);
 
     //Crate histogram
 
     /*
-        let slices_it = file_entries.iter().enumerate().batching(|it| {
-            let mut itpk = it.peekable();
-            match itpk.next() {
-                Some (first) => {
-                    let digest = first.1.digest.load();
-                    let begin = first.0;
-                    let mut count = 0;
-                    itpk.take_while(|elment| {
-                        elment.1.digest.load() == digest
-                    });
-                    match itpk.peek() {
-                        Some(next) => {
-                            Some(&file_entries[begin..next.0 - begin])
-                        }
-                        None => {
-                            Some(&file_entries[begin..file_entries.len() - begin])
-                        }
-                    }
-                }
-                None => None
-            }
-        });
-    */
+     */
 
     /*
         let groups_it = file_entries.iter().batching(|it| {
